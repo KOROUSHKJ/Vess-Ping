@@ -5,6 +5,7 @@ import os
 import socket
 import ssl
 import sys
+import urllib.request
 import uuid
 from urllib.parse import parse_qs, urlparse
 import websockets
@@ -17,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VLESSKeepAlive")
 
-# Pre-configured with your VLESS link
 DEFAULT_VLESS_URL = (
     "vless://Default@johnson-ae836d17.dockfly.app:443"
     "?encryption=none&security=tls&type=ws&host=johnson-ae836d17.dockfly.app"
@@ -25,15 +25,13 @@ DEFAULT_VLESS_URL = (
 )
 
 VLESS_URL = os.environ.get("VLESS_URL", DEFAULT_VLESS_URL)
-PING_INTERVAL = int(os.environ.get("PING_INTERVAL", "20"))  # Seconds between keep-alive pings
-
-# Tunnel destination (using loopback keeps traffic lightweight)
+WS_PING_INTERVAL = 20          # Seconds between WebSocket pings
+HTTP_PING_INTERVAL = 180       # Seconds (3 min) between HTTP requests to reset Dockfly timer
 DEST_HOST = os.environ.get("DEST_HOST", "127.0.0.1")
 DEST_PORT = int(os.environ.get("DEST_PORT", "80"))
 
 
 def parse_vless_config(raw_url: str):
-    """Parses a vless:// URI into a WebSocket URL, HTTP headers, SNI, and UUID bytes."""
     parsed = urlparse(raw_url)
     query = parse_qs(parsed.query)
 
@@ -48,23 +46,22 @@ def parse_vless_config(raw_url: str):
 
     scheme = "wss" if security in ("tls", "reality") else "ws"
     ws_url = f"{scheme}://{host_domain}:{port}{path}"
+    http_url = f"https://{host_domain}/sub/{vless_id}"
 
     headers = {
         "Host": header_host,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
 
-    # Convert identifier to 16-byte VLESS payload format
     try:
         uuid_bytes = uuid.UUID(vless_id).bytes
     except Exception:
         uuid_bytes = vless_id.encode("utf-8").ljust(16, b"\x00")[:16]
 
-    return ws_url, headers, sni, uuid_bytes
+    return ws_url, http_url, headers, sni, uuid_bytes
 
 
 def get_header_kwarg():
-    """Detects whether websockets library requires 'additional_headers' or 'extra_headers'."""
     try:
         sig = inspect.signature(websockets.connect)
         if "additional_headers" in sig.parameters:
@@ -84,29 +81,48 @@ HEADER_KWARG_NAME = get_header_kwarg()
 
 
 def build_vless_header(uuid_bytes: bytes, target_host: str, target_port: int) -> bytes:
-    """Constructs a binary VLESS protocol request header matching main.py parse_vless_header()."""
-    header = bytearray([0x00])              # VLESS Version 0
-    header.extend(uuid_bytes)               # 16-byte UUID space
-    header.append(0x00)                     # Addon length: 0
-    header.append(0x01)                     # Command: 1 (TCP)
+    header = bytearray([0x00])
+    header.extend(uuid_bytes)
+    header.append(0x00)
+    header.append(0x01)
     header.extend(target_port.to_bytes(2, "big"))
 
     try:
         ip_bytes = socket.inet_aton(target_host)
-        header.append(0x01)                 # IPv4 Address
+        header.append(0x01)
         header.extend(ip_bytes)
     except socket.error:
         domain_bytes = target_host.encode("utf-8")
-        header.append(0x02)                 # Domain Address
+        header.append(0x02)
         header.append(len(domain_bytes))
         header.extend(domain_bytes)
 
     return bytes(header)
 
 
+def _send_http_request(url: str):
+    """Sends an HTTP GET request to Dockfly's edge load balancer using standard library."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info(f"[HTTP Edge Ping] Hitting {url} -> Status {resp.status}")
+    except Exception as e:
+        # Status codes like 404/403/302 raise exceptions in urllib, but still reset Dockfly's timer!
+        logger.info(f"[HTTP Edge Ping] Request registered at Dockfly edge: {e}")
+
+
+async def http_keepalive_loop(http_url: str):
+    """Periodically sends HTTP requests to prevent Dockfly scale-to-zero timer from expiring."""
+    while True:
+        await asyncio.to_thread(_send_http_request, http_url)
+        await asyncio.sleep(HTTP_PING_INTERVAL)
+
+
 async def run_vless_keepalive():
-    """Establishes and maintains an active VLESS connection continuously."""
-    ws_url, headers, sni, uuid_bytes = parse_vless_config(VLESS_URL)
+    ws_url, http_url, headers, sni, uuid_bytes = parse_vless_config(VLESS_URL)
 
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.server_hostname = sni
@@ -120,23 +136,23 @@ async def run_vless_keepalive():
         HEADER_KWARG_NAME: headers,
     }
 
+    # Start background HTTP pings
+    asyncio.create_task(http_keepalive_loop(http_url))
+
     while True:
         try:
             logger.info(f"[VLESS WS] Connecting to {ws_url}...")
 
             async with websockets.connect(ws_url, **ws_kwargs) as ws:
                 logger.info("[VLESS WS] Connection established! Sending VLESS binary handshake...")
-
-                # 1. Send the VLESS handshake header
                 await ws.send(vless_payload)
-                logger.info("[VLESS WS] Handshake accepted! VLESS connection is continuously ACTIVE.")
+                logger.info("[VLESS WS] Handshake accepted! Connection active.")
 
-                # 2. Continuous keep-alive loop over the open socket connection
                 while True:
-                    await asyncio.sleep(PING_INTERVAL)
+                    await asyncio.sleep(WS_PING_INTERVAL)
                     pong_waiter = await ws.ping()
                     await pong_waiter
-                    logger.info("[VLESS WS] Heartbeat ping/pong frame exchanged.")
+                    logger.info("[VLESS WS] Heartbeat ping frame exchanged.")
 
         except (websockets.exceptions.ConnectionClosed, Exception) as err:
             logger.error(f"[VLESS WS] Connection dropped: {err}")
@@ -144,14 +160,45 @@ async def run_vless_keepalive():
             await asyncio.sleep(10)
 
 
+async def handle_platform_health_check(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        await reader.read(1024)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 12\r\n"
+            "Connection: close\r\n\r\n"
+            "Bot Active\n"
+        )
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def start_dummy_http_server():
+    port = int(os.environ.get("PORT", "8080"))
+    server = await asyncio.start_server(handle_platform_handle_check if 'handle_platform_handle_check' in globals() else handle_platform_health_check, "0.0.0.0", port)
+    logger.info(f"[HTTP Server] Listening on 0.0.0.0:{port} for apply.build health checks.")
+    async with server:
+        await server.serve_forever()
+
+
 async def main():
-    ws_url, _, sni, _ = parse_vless_config(VLESS_URL)
+    ws_url, http_url, _, sni, _ = parse_vless_config(VLESS_URL)
     logger.info("================================================")
-    logger.info("   Pure VLESS Config Keep-Alive Active          ")
+    logger.info("   VLESS Dual-Mode Keep-Alive Active            ")
     logger.info(f"   Target Endpoint : {ws_url}")
-    logger.info(f"   SNI Server Name : {sni}")
+    logger.info(f"   HTTP Edge Ping  : {http_url}")
     logger.info("================================================")
-    await run_vless_keepalive()
+
+    await asyncio.gather(
+        start_dummy_http_server(),
+        run_vless_keepalive()
+    )
 
 
 if __name__ == "__main__":
