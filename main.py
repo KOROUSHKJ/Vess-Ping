@@ -101,7 +101,7 @@ def build_vless_header(uuid_bytes: bytes, target_host: str, target_port: int) ->
 
 
 def _send_http_request(url: str):
-    """Sends an HTTP GET request to Dockfly's edge load balancer using standard library."""
+    """Sends an HTTP GET request to the edge load balancer using standard library."""
     try:
         req = urllib.request.Request(
             url,
@@ -110,12 +110,11 @@ def _send_http_request(url: str):
         with urllib.request.urlopen(req, timeout=10) as resp:
             logger.info(f"[HTTP Edge Ping] Hitting {url} -> Status {resp.status}")
     except Exception as e:
-        # Status codes like 404/403/302 raise exceptions in urllib, but still reset Dockfly's timer!
-        logger.info(f"[HTTP Edge Ping] Request registered at Dockfly edge: {e}")
+        logger.info(f"[HTTP Edge Ping] Request registered at edge: {e}")
 
 
 async def http_keepalive_loop(http_url: str):
-    """Periodically sends HTTP requests to prevent Dockfly scale-to-zero timer from expiring."""
+    """Periodically sends HTTP requests to prevent platform scale-to-zero timeouts."""
     while True:
         await asyncio.to_thread(_send_http_request, http_url)
         await asyncio.sleep(HTTP_PING_INTERVAL)
@@ -181,14 +180,14 @@ async def handle_platform_health_check(reader: asyncio.StreamReader, writer: asy
 
 async def start_dummy_http_server():
     port = int(os.environ.get("PORT", "8080"))
-    server = await asyncio.start_server(handle_platform_handle_check if 'handle_platform_handle_check' in globals() else handle_platform_health_check, "0.0.0.0", port)
-    logger.info(f"[HTTP Server] Listening on 0.0.0.0:{port} for apply.build health checks.")
+    server = await asyncio.start_server(handle_platform_health_check, "0.0.0.0", port)
+    logger.info(f"[HTTP Server] Listening on 0.0.0.0:{port} for platform health checks.")
     async with server:
         await server.serve_forever()
 
 
 async def main():
-    ws_url, http_url, _, sni, _ = parse_vless_config(VLESS_URL)
+    ws_url, http_url, _, _, _ = parse_vless_config(VLESS_URL)
     logger.info("================================================")
     logger.info("   VLESS Dual-Mode Keep-Alive Active            ")
     logger.info(f"   Target Endpoint : {ws_url}")
