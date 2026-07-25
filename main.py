@@ -1,14 +1,9 @@
 import asyncio
-import inspect
 import logging
 import os
-import socket
-import ssl
 import sys
 import urllib.request
-import uuid
-from urllib.parse import parse_qs, urlparse
-import websockets
+import urllib.error
 
 # Configure clean logging
 logging.basicConfig(
@@ -16,150 +11,91 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("VLESSKeepAlive")
+logger = logging.getLogger("DockflyWakeBot")
 
-DEFAULT_VLESS_URL = (
-    "vless://Default@johnson-ae836d17.dockfly.app:443"
-    "?encryption=none&security=tls&type=ws&host=johnson-ae836d17.dockfly.app"
-    "&path=/ws/Default&sni=johnson-ae836d17.dockfly.app&fp=chrome&alpn=http/1.1#Luffy-Default"
-)
+# --- Configuration & Constants ---
+APP_URL = "https://johnson-ae836d17.dockfly.app"
+HTTP_PING_INTERVAL = 180       # Seconds (3 min) between checks
 
-VLESS_URL = os.environ.get("VLESS_URL", DEFAULT_VLESS_URL)
-WS_PING_INTERVAL = 20          # Seconds between WebSocket pings
-HTTP_PING_INTERVAL = 180       # Seconds (3 min) between HTTP requests to reset Dockfly timer
-DEST_HOST = os.environ.get("DEST_HOST", "127.0.0.1")
-DEST_PORT = int(os.environ.get("DEST_PORT", "80"))
+# --- Dockfly API Wake-Up Credentials ---
+DOCKFLY_API_TOKEN = "paat_yn92ycn3_dddd693a700f02227959e5b0c3376aef275c2d03d742acbc6489d35328a22e80"
+DOCKFLY_WAKE_URL = "https://api.dockfly.app/projects/019f7985-494f-75ca-ab9d-08f2a0bda2e8/services/019f938a-4aab-7492-9e46-2817ae836d17/start"
 
 
-def parse_vless_config(raw_url: str):
-    parsed = urlparse(raw_url)
-    query = parse_qs(parsed.query)
-
-    vless_id = parsed.username or "Default"
-    host_domain = parsed.hostname or "johnson-ae836d17.dockfly.app"
-    port = parsed.port or 443
-
-    security = query.get("security", ["tls"])[0]
-    path = query.get("path", ["/ws/Default"])[0]
-    sni = query.get("sni", [host_domain])[0]
-    header_host = query.get("host", [host_domain])[0]
-
-    scheme = "wss" if security in ("tls", "reality") else "ws"
-    ws_url = f"{scheme}://{host_domain}:{port}{path}"
-    http_url = f"https://{host_domain}/sub/{vless_id}"
-
-    headers = {
-        "Host": header_host,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-
-    try:
-        uuid_bytes = uuid.UUID(vless_id).bytes
-    except Exception:
-        uuid_bytes = vless_id.encode("utf-8").ljust(16, b"\x00")[:16]
-
-    return ws_url, http_url, headers, sni, uuid_bytes
-
-
-def get_header_kwarg():
-    try:
-        sig = inspect.signature(websockets.connect)
-        if "additional_headers" in sig.parameters:
-            return "additional_headers"
-        if "extra_headers" in sig.parameters:
-            return "extra_headers"
-    except Exception:
-        pass
-
-    ws_version = getattr(websockets, "__version__", "")
-    if ws_version and int(ws_version.split(".")[0]) >= 13:
-        return "additional_headers"
-    return "extra_headers"
-
-
-HEADER_KWARG_NAME = get_header_kwarg()
-
-
-def build_vless_header(uuid_bytes: bytes, target_host: str, target_port: int) -> bytes:
-    header = bytearray([0x00])
-    header.extend(uuid_bytes)
-    header.append(0x00)
-    header.append(0x01)
-    header.extend(target_port.to_bytes(2, "big"))
-
-    try:
-        ip_bytes = socket.inet_aton(target_host)
-        header.append(0x01)
-        header.extend(ip_bytes)
-    except socket.error:
-        domain_bytes = target_host.encode("utf-8")
-        header.append(0x02)
-        header.append(len(domain_bytes))
-        header.extend(domain_bytes)
-
-    return bytes(header)
-
-
-def _send_http_request(url: str):
-    """Sends an HTTP GET request to the edge load balancer using standard library."""
+def _send_api_wake_request():
+    """Sends a direct POST request to Dockfly API to wake up the container."""
     try:
         req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            DOCKFLY_WAKE_URL,
+            data=b"{}",  # Empty JSON body required for POST
+            headers={
+                "Authorization": f"Bearer {DOCKFLY_API_TOKEN}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "ApplyBuild-WakeBot/1.0"
+            },
+            method="POST"
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(f"[HTTP Edge Ping] Hitting {url} -> Status {resp.status}")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            logger.info(f"[API Wake Trigger] Command sent! Status: {resp.status}")
+    except urllib.error.HTTPError as e:
+        logger.error(f"[API Wake Trigger] Failed with HTTP Error: {e.code} - {e.reason}")
     except Exception as e:
-        logger.info(f"[HTTP Edge Ping] Request registered at edge: {e}")
+        logger.error(f"[API Wake Trigger] Connection error: {e}")
 
 
-async def http_keepalive_loop(http_url: str):
-    """Periodically sends HTTP requests to prevent platform scale-to-zero timeouts."""
+async def http_keepalive_loop():
+    """Checks if server is alive, and only triggers the API wake command if it's asleep."""
     while True:
-        await asyncio.to_thread(_send_http_request, http_url)
+        is_awake = False
+        
+        # 1. Check if the server is already awake
+        try:
+            req = urllib.request.Request(
+                APP_URL, 
+                headers={"User-Agent": "ApplyBuild-WakeBot/1.0"}
+            )
+            
+            def check_alive():
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status
+            
+            status_code = await asyncio.to_thread(check_alive)
+            
+            if status_code == 200:
+                logger.info("[Status Check] Server is ALIVE. Skipping API wake command.")
+                is_awake = True
+            else:
+                logger.info(f"[Status Check] Server returned {status_code}. Triggering wake up...")
+                
+        except Exception as e:
+            logger.info(f"[Status Check] Server is ASLEEP or unreachable. Triggering wake up...")
+
+        # 2. If asleep, hit the Dockfly API to wake it
+        if not is_awake:
+            await asyncio.to_thread(_send_api_wake_request)
+            
+            # Wait 10 seconds for the container's cold-start
+            await asyncio.sleep(10)
+            
+            # Verify it actually woke up
+            try:
+                req = urllib.request.Request(APP_URL, headers={"User-Agent": "ApplyBuild-WakeBot/1.0"})
+                def verify_alive():
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.status
+                
+                verify_status = await asyncio.to_thread(verify_alive)
+                logger.info(f"[Post-Wake Check] Server successfully booted! Status: {verify_status}")
+            except Exception as e:
+                logger.warning(f"[Post-Wake Check] Server might still be booting: {e}")
+
+        # 3. Wait 3 minutes before checking again
         await asyncio.sleep(HTTP_PING_INTERVAL)
 
 
-async def run_vless_keepalive():
-    ws_url, http_url, headers, sni, uuid_bytes = parse_vless_config(VLESS_URL)
-
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.server_hostname = sni
-
-    vless_payload = build_vless_header(uuid_bytes, DEST_HOST, DEST_PORT)
-
-    ws_kwargs = {
-        "ssl": ssl_ctx,
-        "ping_interval": 20,
-        "ping_timeout": 20,
-        HEADER_KWARG_NAME: headers,
-    }
-
-    # Start background HTTP pings
-    asyncio.create_task(http_keepalive_loop(http_url))
-
-    while True:
-        try:
-            logger.info(f"[VLESS WS] Connecting to {ws_url}...")
-
-            async with websockets.connect(ws_url, **ws_kwargs) as ws:
-                logger.info("[VLESS WS] Connection established! Sending VLESS binary handshake...")
-                await ws.send(vless_payload)
-                logger.info("[VLESS WS] Handshake accepted! Connection active.")
-
-                while True:
-                    await asyncio.sleep(WS_PING_INTERVAL)
-                    pong_waiter = await ws.ping()
-                    await pong_waiter
-                    logger.info("[VLESS WS] Heartbeat ping frame exchanged.")
-
-        except (websockets.exceptions.ConnectionClosed, Exception) as err:
-            logger.error(f"[VLESS WS] Connection dropped: {err}")
-            logger.info("[VLESS WS] Reconnecting in 10 seconds...")
-            await asyncio.sleep(10)
-
-
 async def handle_platform_health_check(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Answers the internal ping from apply.build so the worker isn't killed."""
     try:
         await reader.read(1024)
         response = (
@@ -187,16 +123,14 @@ async def start_dummy_http_server():
 
 
 async def main():
-    ws_url, http_url, _, _, _ = parse_vless_config(VLESS_URL)
     logger.info("================================================")
-    logger.info("   VLESS Dual-Mode Keep-Alive Active            ")
-    logger.info(f"   Target Endpoint : {ws_url}")
-    logger.info(f"   HTTP Edge Ping  : {http_url}")
+    logger.info("   Dockfly Auto-Wake Bot Active                 ")
+    logger.info(f"   Target URL : {APP_URL}")
     logger.info("================================================")
 
     await asyncio.gather(
         start_dummy_http_server(),
-        run_vless_keepalive()
+        http_keepalive_loop()
     )
 
 
