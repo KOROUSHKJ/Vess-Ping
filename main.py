@@ -38,13 +38,13 @@ wh.setFormatter(formatter)
 logger.addHandler(wh)
 
 # --- Configuration & Constants ---
-APP_URL = "https://johnson-ae836d17.dockfly.app"
+APP_URL = "https://karl-5d6932bd.dockfly.app"
 HTTP_PING_INTERVAL = 180       # Seconds (3 min) between checks
 
 # --- Dockfly API Credentials ---
-DOCKFLY_API_TOKEN = "paat_yn92ycn3_dddd693a700f02227959e5b0c3376aef275c2d03d742acbc6489d35328a22e80"
-DOCKFLY_WAKE_URL = "https://api.dockfly.app/projects/019f7985-494f-75ca-ab9d-08f2a0bda2e8/services/019f938a-4aab-7492-9e46-2817ae836d17/start"
-DOCKFLY_DEPLOY_URL = "https://api.dockfly.app/projects/019f7985-494f-75ca-ab9d-08f2a0bda2e8/services/019f938a-4aab-7492-9e46-2817ae836d17/deployments"
+DOCKFLY_API_TOKEN = "paat_gkvxe5ra_6b0b7ddafb1c21a1955f0ab9b3866e8fb0f043816b643b3b9f81a2035903c38f"
+DOCKFLY_WAKE_URL = "https://api.dockfly.app/projects/01a0142c-b1d4-779a-9adc-1d3b55c4814c/services/01a0142d-b2ae-7aec-8028-2dc45d6932bd/start"
+DOCKFLY_DEPLOY_URL = "https://api.dockfly.app/projects/01a0142c-b1d4-779a-9adc-1d3b55c4814c/services/01a0142d-b2ae-7aec-8028-2dc45d6932bd/deployments"
 
 
 def reset_stats_if_new_day():
